@@ -1,5 +1,5 @@
 # Wybieramy oficjalny obraz Rusta
-FROM rust:1.76-slim-bullseye AS builder
+FROM rust:1-slim-bullseye AS builder
 
 WORKDIR /usr/src/app
 COPY . .
