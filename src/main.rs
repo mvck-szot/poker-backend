@@ -5,10 +5,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-// Usunięto nieużywany HashMap i StreamExt, żeby wyczyścić terminal
 use futures::sink::SinkExt;
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -69,6 +69,27 @@ struct SolveQuery {
     board: Option<String>,
     pos: Option<String>,
     history: Option<String>,
+}
+
+// Struktury dla Znajomych
+#[derive(Serialize, Deserialize)]
+struct FriendRequest {
+    user_id: i32,
+    friend_username: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FriendAction {
+    user_id: i32,
+    friend_id: i32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FriendInfo {
+    id: i32,
+    username: String,
+    elo_1v1: i32,
+    status: String,
 }
 
 // --- LOGIKA POKEROWA (GTO & Heurystyka) ---
@@ -270,6 +291,19 @@ fn init_db() -> Result<()> {
     let conn = Connection::open("poker.db")?;
     conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, elo_train INTEGER NOT NULL DEFAULT 1000, elo_1v1 INTEGER NOT NULL DEFAULT 1000, elo_1v7 INTEGER NOT NULL DEFAULT 1000, streak INTEGER NOT NULL DEFAULT 0, hands_played INTEGER NOT NULL DEFAULT 0)", [])?;
     conn.execute("CREATE TABLE IF NOT EXISTS stats (id INTEGER PRIMARY KEY, elo_train INTEGER NOT NULL DEFAULT 1000, elo_1v1 INTEGER NOT NULL DEFAULT 1000, elo_1v7 INTEGER NOT NULL DEFAULT 1000, streak INTEGER NOT NULL DEFAULT 0, hands_played INTEGER NOT NULL DEFAULT 0)", [])?;
+
+    // Tabela znajomych
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS friends (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        friend_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        UNIQUE(user_id, friend_id)
+    )",
+        [],
+    )?;
+
     let count: i32 = conn.query_row("SELECT COUNT(*) FROM stats", [], |row| row.get(0))?;
     if count == 0 {
         conn.execute("INSERT INTO stats (id, elo_train, elo_1v1, elo_1v7, streak, hands_played) VALUES (1, 1000, 1000, 1000, 0, 0)", [])?;
@@ -401,13 +435,11 @@ async fn solve_handler(Query(params): Query<SolveQuery>) -> Json<serde_json::Val
     }))
 }
 
-// NOWOŚĆ: Handler obsługujący Arenę 1v1
 async fn arena_handler(Query(params): Query<ArenaQuery>) -> Json<serde_json::Value> {
     let board = params.board.unwrap_or_default();
     let pos = params.pos.unwrap_or_default();
     let strategy = get_smart_gto_strategy(&params.hand, &board, "", &pos);
 
-    // Obliczamy losowy ruch bota bazując na jego ELO (wyższa szansa na błąd przy niskim ELO)
     let (bot_action, bot_damage) = simulate_bot_action(&strategy, params.bot_elo, 0);
 
     Json(serde_json::json!({
@@ -417,9 +449,92 @@ async fn arena_handler(Query(params): Query<ArenaQuery>) -> Json<serde_json::Val
     }))
 }
 
-// NOWOŚĆ: Dummy handler dla tabelek Preflop (zwraca pusty JSON, aby zadowolić frontend)
 async fn preflop_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({}))
+}
+
+// --- HANDLERY DLA ZNAJOMYCH ---
+async fn send_friend_request(Json(payload): Json<FriendRequest>) -> Json<serde_json::Value> {
+    let conn = Connection::open("poker.db").unwrap();
+    let friend_id: Result<i32, _> = conn.query_row(
+        "SELECT id FROM users WHERE username = ?1",
+        params![payload.friend_username],
+        |row| row.get(0),
+    );
+
+    match friend_id {
+        Ok(fid) => {
+            if fid == payload.user_id {
+                return Json(
+                    serde_json::json!({"success": false, "message": "Nie możesz dodać samego siebie"}),
+                );
+            }
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO friends (user_id, friend_id, status) VALUES (?1, ?2, 'pending')",
+                params![payload.user_id, fid],
+            );
+            Json(serde_json::json!({"success": true, "message": "Wysłano zaproszenie!"}))
+        }
+        Err(_) => Json(
+            serde_json::json!({"success": false, "message": "Nie znaleziono gracza o takim nicku"}),
+        ),
+    }
+}
+
+async fn accept_friend_request(Json(payload): Json<FriendAction>) -> Json<serde_json::Value> {
+    let conn = Connection::open("poker.db").unwrap();
+    let _ = conn.execute(
+        "UPDATE friends SET status = 'accepted' WHERE user_id = ?1 AND friend_id = ?2",
+        params![payload.friend_id, payload.user_id],
+    );
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO friends (user_id, friend_id, status) VALUES (?1, ?2, 'accepted')",
+        params![payload.user_id, payload.friend_id],
+    );
+    Json(serde_json::json!({"success": true, "message": "Zaakceptowano!"}))
+}
+
+async fn get_friends(Query(params): Query<HashMap<String, String>>) -> Json<Vec<FriendInfo>> {
+    let user_id = params
+        .get("user_id")
+        .and_then(|id| id.parse::<i32>().ok())
+        .unwrap_or(0);
+    let conn = Connection::open("poker.db").unwrap();
+
+    let mut friends_list = Vec::new();
+    let mut stmt = conn
+        .prepare(
+            "
+        SELECT u.id, u.username, u.elo_1v1, f.status
+        FROM users u
+        JOIN friends f ON u.id = f.friend_id
+        WHERE f.user_id = ?1 AND f.status = 'accepted'
+        UNION
+        SELECT u.id, u.username, u.elo_1v1, f.status
+        FROM users u
+        JOIN friends f ON u.id = f.user_id
+        WHERE f.friend_id = ?1 AND f.status = 'pending'
+    ",
+        )
+        .unwrap();
+
+    let friend_iter = stmt
+        .query_map(params![user_id], |row| {
+            Ok(FriendInfo {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                elo_1v1: row.get(2)?,
+                status: row.get(3)?,
+            })
+        })
+        .unwrap();
+
+    for f in friend_iter {
+        if let Ok(friend) = f {
+            friends_list.push(friend);
+        }
+    }
+    Json(friends_list)
 }
 
 // === WEBSOCKET: MAGICZNY REAL-TIME DLA ARENY 1v7 ===
@@ -434,16 +549,12 @@ async fn handle_socket(mut socket: WebSocket) {
                 if let Ok(req) = serde_json::from_str::<WsArenaRequest>(text) {
                     let strategy = get_smart_gto_strategy(&req.hand, &req.board, "", &req.pos);
 
-                    // Najpierw wysyłamy strategię dla Hero
                     let strat_msg = serde_json::json!({ "type": "strategy", "strategy": strategy });
                     let _ = socket.send(Message::Text(strat_msg.to_string())).await;
 
-                    // Definiujemy boty
                     let bot_elos = [800, 1000, 1200, 1500, 1800, 2100, 2500];
 
-                    // STRUMIENIOWANIE - Boty grają po kolei z opóźnieniem!
                     for (i, elo) in bot_elos.iter().enumerate() {
-                        // Sztuczne "myślenie" bota - 800 milisekund przerwy
                         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
                         let (action, damage) =
@@ -456,7 +567,7 @@ async fn handle_socket(mut socket: WebSocket) {
                             .await
                             .is_err()
                         {
-                            break; // Rozłączono
+                            break;
                         }
                     }
                 }
@@ -483,12 +594,14 @@ async fn main() {
             get(get_stats_handler).post(update_stats_handler),
         )
         .route("/api/solve", get(solve_handler))
-        .route("/api/arena", get(arena_handler)) // PODPIĘTO ARENĘ 1v1
-        .route("/api/preflop", get(preflop_handler)) // PODPIĘTO DUMMY PREFLOP
+        .route("/api/arena", get(arena_handler))
+        .route("/api/preflop", get(preflop_handler))
         .route("/ws/arena8", get(ws_arena_handler))
+        .route("/api/friends/add", post(send_friend_request)) // NOWE
+        .route("/api/friends/accept", post(accept_friend_request)) // NOWE
+        .route("/api/friends/list", get(get_friends)) // NOWE
         .layer(cors);
 
-    // CHMURA: Pobieramy port przydzielony przez serwer, a domyślnie używamy 3001 (dla testów u Ciebie)
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
     let addr = format!("0.0.0.0:{}", port);
 
