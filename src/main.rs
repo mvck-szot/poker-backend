@@ -5,10 +5,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::{sink::SinkExt, stream::StreamExt};
+// Usunięto nieużywany HashMap i StreamExt, żeby wyczyścić terminal
+use futures::sink::SinkExt;
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -55,8 +55,23 @@ struct WsArenaRequest {
     pos: String,
 }
 
+#[derive(Deserialize)]
+struct ArenaQuery {
+    hand: String,
+    board: Option<String>,
+    pos: Option<String>,
+    bot_elo: i32,
+}
+
+#[derive(Deserialize)]
+struct SolveQuery {
+    hand: String,
+    board: Option<String>,
+    pos: Option<String>,
+    history: Option<String>,
+}
+
 // --- LOGIKA POKEROWA (GTO & Heurystyka) ---
-// (Ta część zostaje dokładnie taka sama - to nasz dopieszczony silnik)
 fn evaluate_poker_strength(hand: &str, board: &str) -> f32 {
     let r1 = &hand[0..1];
     let r2 = &hand[2..3];
@@ -374,14 +389,6 @@ async fn update_stats_handler(Json(payload): Json<UpdateStatsRequest>) -> Json<s
     Json(serde_json::json!({"status": "ok"}))
 }
 
-#[derive(Deserialize)]
-struct SolveQuery {
-    hand: String,
-    board: Option<String>,
-    pos: Option<String>,
-    history: Option<String>,
-}
-
 async fn solve_handler(Query(params): Query<SolveQuery>) -> Json<serde_json::Value> {
     let board = params.board.unwrap_or_default();
     let pos = params.pos.unwrap_or_default();
@@ -392,6 +399,27 @@ async fn solve_handler(Query(params): Query<SolveQuery>) -> Json<serde_json::Val
         "equity": evaluate_poker_strength(&params.hand, &board),
         "villain_range": []
     }))
+}
+
+// NOWOŚĆ: Handler obsługujący Arenę 1v1
+async fn arena_handler(Query(params): Query<ArenaQuery>) -> Json<serde_json::Value> {
+    let board = params.board.unwrap_or_default();
+    let pos = params.pos.unwrap_or_default();
+    let strategy = get_smart_gto_strategy(&params.hand, &board, "", &pos);
+
+    // Obliczamy losowy ruch bota bazując na jego ELO (wyższa szansa na błąd przy niskim ELO)
+    let (bot_action, bot_damage) = simulate_bot_action(&strategy, params.bot_elo, 0);
+
+    Json(serde_json::json!({
+        "strategy": strategy,
+        "bot_action": bot_action,
+        "bot_damage": bot_damage
+    }))
+}
+
+// NOWOŚĆ: Dummy handler dla tabelek Preflop (zwraca pusty JSON, aby zadowolić frontend)
+async fn preflop_handler() -> Json<serde_json::Value> {
+    Json(serde_json::json!({}))
 }
 
 // === WEBSOCKET: MAGICZNY REAL-TIME DLA ARENY 1v7 ===
@@ -455,7 +483,9 @@ async fn main() {
             get(get_stats_handler).post(update_stats_handler),
         )
         .route("/api/solve", get(solve_handler))
-        .route("/ws/arena8", get(ws_arena_handler)) // NOWY WEBSOCKET ENDPOINT
+        .route("/api/arena", get(arena_handler)) // PODPIĘTO ARENĘ 1v1
+        .route("/api/preflop", get(preflop_handler)) // PODPIĘTO DUMMY PREFLOP
+        .route("/ws/arena8", get(ws_arena_handler))
         .layer(cors);
 
     // CHMURA: Pobieramy port przydzielony przez serwer, a domyślnie używamy 3001 (dla testów u Ciebie)
