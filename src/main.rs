@@ -1,18 +1,22 @@
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::Query,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Query, State,
+    },
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use futures::sink::SinkExt;
+use futures::{sink::SinkExt, stream::StreamExt};
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tower_http::cors::{Any, CorsLayer};
 
-// --- STRUKTURY DANYCH ---
+// --- STRUKTURY DANYCH BAZOWE ---
 #[derive(Serialize, Deserialize)]
 struct AuthRequest {
     username: String,
@@ -48,13 +52,6 @@ struct UpdateStatsRequest {
     hands_played: i32,
 }
 
-#[derive(Serialize, Deserialize)]
-struct WsArenaRequest {
-    hand: String,
-    board: String,
-    pos: String,
-}
-
 #[derive(Deserialize)]
 struct ArenaQuery {
     hand: String,
@@ -71,7 +68,14 @@ struct SolveQuery {
     history: Option<String>,
 }
 
-// Struktury dla Znajomych
+#[derive(Serialize, Deserialize)]
+struct WsArenaRequest {
+    hand: String,
+    board: String,
+    pos: String,
+}
+
+// --- STRUKTURY DLA ZNAJOMYCH ---
 #[derive(Serialize, Deserialize)]
 struct FriendRequest {
     user_id: i32,
@@ -90,6 +94,44 @@ struct FriendInfo {
     username: String,
     elo_1v1: i32,
     status: String,
+}
+
+// --- ZAAWANSOWANE STRUKTURY DLA GTO DUEL (LIVE) ---
+#[derive(Clone)]
+struct DuelPlayer {
+    user_id: i32,
+    username: String,
+    hp: i32,
+    action: Option<usize>,
+    sender: mpsc::UnboundedSender<String>, // Kanał do komunikacji z konkretnym graczem
+}
+
+struct DuelRoom {
+    players: Vec<DuelPlayer>,
+    strategy: Option<[f32; 4]>,
+}
+
+// Współdzielony stan serwera - przechowuje wszystkie aktywne pokoje
+type SharedState = Arc<Mutex<HashMap<String, DuelRoom>>>;
+
+#[derive(Deserialize)]
+struct DuelQuery {
+    room_id: String,
+    user_id: i32,
+    username: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum DuelClientMessage {
+    #[serde(rename = "new_round")]
+    NewRound {
+        hand: String,
+        board: String,
+        pos: String,
+    },
+    #[serde(rename = "action")]
+    Action { action_idx: usize },
 }
 
 // --- LOGIKA POKEROWA (GTO & Heurystyka) ---
@@ -291,18 +333,7 @@ fn init_db() -> Result<()> {
     let conn = Connection::open("poker.db")?;
     conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, elo_train INTEGER NOT NULL DEFAULT 1000, elo_1v1 INTEGER NOT NULL DEFAULT 1000, elo_1v7 INTEGER NOT NULL DEFAULT 1000, streak INTEGER NOT NULL DEFAULT 0, hands_played INTEGER NOT NULL DEFAULT 0)", [])?;
     conn.execute("CREATE TABLE IF NOT EXISTS stats (id INTEGER PRIMARY KEY, elo_train INTEGER NOT NULL DEFAULT 1000, elo_1v1 INTEGER NOT NULL DEFAULT 1000, elo_1v7 INTEGER NOT NULL DEFAULT 1000, streak INTEGER NOT NULL DEFAULT 0, hands_played INTEGER NOT NULL DEFAULT 0)", [])?;
-
-    // Tabela znajomych
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS friends (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        friend_id INTEGER NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        UNIQUE(user_id, friend_id)
-    )",
-        [],
-    )?;
+    conn.execute("CREATE TABLE IF NOT EXISTS friends (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', UNIQUE(user_id, friend_id))", [])?;
 
     let count: i32 = conn.query_row("SELECT COUNT(*) FROM stats", [], |row| row.get(0))?;
     if count == 0 {
@@ -311,7 +342,14 @@ fn init_db() -> Result<()> {
     Ok(())
 }
 
-// --- HANDLERY AXUM ---
+async fn update_duel_elo(winner_id: i32, loser_id: i32) -> Result<(), rusqlite::Error> {
+    let conn = Connection::open("poker.db")?;
+    conn.execute("UPDATE users SET elo_1v1 = elo_1v1 + 25, streak = streak + 1, hands_played = hands_played + 1 WHERE id = ?1", params![winner_id])?;
+    conn.execute("UPDATE users SET elo_1v1 = MAX(0, elo_1v1 - 25), streak = 0, hands_played = hands_played + 1 WHERE id = ?1", params![loser_id])?;
+    Ok(())
+}
+
+// --- HANDLERY AXUM (REST API) ---
 async fn login_handler(Json(payload): Json<AuthRequest>) -> Json<UserResponse> {
     let conn = Connection::open("poker.db").unwrap();
     let mut stmt = conn.prepare("SELECT id, username, elo_train, elo_1v1, elo_1v7 FROM users WHERE username = ?1 AND password = ?2").unwrap();
@@ -428,32 +466,25 @@ async fn solve_handler(Query(params): Query<SolveQuery>) -> Json<serde_json::Val
     let pos = params.pos.unwrap_or_default();
     let history = params.history.unwrap_or_default();
     let strategy = get_smart_gto_strategy(&params.hand, &board, &history, &pos);
-    Json(serde_json::json!({
-        "strategy": strategy,
-        "equity": evaluate_poker_strength(&params.hand, &board),
-        "villain_range": []
-    }))
+    Json(
+        serde_json::json!({ "strategy": strategy, "equity": evaluate_poker_strength(&params.hand, &board), "villain_range": [] }),
+    )
 }
 
 async fn arena_handler(Query(params): Query<ArenaQuery>) -> Json<serde_json::Value> {
     let board = params.board.unwrap_or_default();
     let pos = params.pos.unwrap_or_default();
     let strategy = get_smart_gto_strategy(&params.hand, &board, "", &pos);
-
     let (bot_action, bot_damage) = simulate_bot_action(&strategy, params.bot_elo, 0);
-
-    Json(serde_json::json!({
-        "strategy": strategy,
-        "bot_action": bot_action,
-        "bot_damage": bot_damage
-    }))
+    Json(
+        serde_json::json!({ "strategy": strategy, "bot_action": bot_action, "bot_damage": bot_damage }),
+    )
 }
 
 async fn preflop_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({}))
 }
 
-// --- HANDLERY DLA ZNAJOMYCH ---
 async fn send_friend_request(Json(payload): Json<FriendRequest>) -> Json<serde_json::Value> {
     let conn = Connection::open("poker.db").unwrap();
     let friend_id: Result<i32, _> = conn.query_row(
@@ -461,7 +492,6 @@ async fn send_friend_request(Json(payload): Json<FriendRequest>) -> Json<serde_j
         params![payload.friend_username],
         |row| row.get(0),
     );
-
     match friend_id {
         Ok(fid) => {
             if fid == payload.user_id {
@@ -469,15 +499,10 @@ async fn send_friend_request(Json(payload): Json<FriendRequest>) -> Json<serde_j
                     serde_json::json!({"success": false, "message": "Nie możesz dodać samego siebie"}),
                 );
             }
-            let _ = conn.execute(
-                "INSERT OR IGNORE INTO friends (user_id, friend_id, status) VALUES (?1, ?2, 'pending')",
-                params![payload.user_id, fid],
-            );
+            let _ = conn.execute("INSERT OR IGNORE INTO friends (user_id, friend_id, status) VALUES (?1, ?2, 'pending')", params![payload.user_id, fid]);
             Json(serde_json::json!({"success": true, "message": "Wysłano zaproszenie!"}))
         }
-        Err(_) => Json(
-            serde_json::json!({"success": false, "message": "Nie znaleziono gracza o takim nicku"}),
-        ),
+        Err(_) => Json(serde_json::json!({"success": false, "message": "Nie znaleziono gracza"})),
     }
 }
 
@@ -500,24 +525,12 @@ async fn get_friends(Query(params): Query<HashMap<String, String>>) -> Json<Vec<
         .and_then(|id| id.parse::<i32>().ok())
         .unwrap_or(0);
     let conn = Connection::open("poker.db").unwrap();
-
     let mut friends_list = Vec::new();
-    let mut stmt = conn
-        .prepare(
-            "
-        SELECT u.id, u.username, u.elo_1v1, f.status
-        FROM users u
-        JOIN friends f ON u.id = f.friend_id
-        WHERE f.user_id = ?1 AND f.status = 'accepted'
+    let mut stmt = conn.prepare("
+        SELECT u.id, u.username, u.elo_1v1, f.status FROM users u JOIN friends f ON u.id = f.friend_id WHERE f.user_id = ?1 AND f.status = 'accepted'
         UNION
-        SELECT u.id, u.username, u.elo_1v1, f.status
-        FROM users u
-        JOIN friends f ON u.id = f.user_id
-        WHERE f.friend_id = ?1 AND f.status = 'pending'
-    ",
-        )
-        .unwrap();
-
+        SELECT u.id, u.username, u.elo_1v1, f.status FROM users u JOIN friends f ON u.id = f.user_id WHERE f.friend_id = ?1 AND f.status = 'pending'
+    ").unwrap();
     let friend_iter = stmt
         .query_map(params![user_id], |row| {
             Ok(FriendInfo {
@@ -528,7 +541,6 @@ async fn get_friends(Query(params): Query<HashMap<String, String>>) -> Json<Vec<
             })
         })
         .unwrap();
-
     for f in friend_iter {
         if let Ok(friend) = f {
             friends_list.push(friend);
@@ -537,7 +549,7 @@ async fn get_friends(Query(params): Query<HashMap<String, String>>) -> Json<Vec<
     Json(friends_list)
 }
 
-// === WEBSOCKET: MAGICZNY REAL-TIME DLA ARENY 1v7 ===
+// === WEBSOCKET 1v7 (STARE, DO GRY Z BOTAMI) ===
 async fn ws_arena_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(handle_socket)
 }
@@ -548,20 +560,14 @@ async fn handle_socket(mut socket: WebSocket) {
             if let Ok(text) = msg.to_text() {
                 if let Ok(req) = serde_json::from_str::<WsArenaRequest>(text) {
                     let strategy = get_smart_gto_strategy(&req.hand, &req.board, "", &req.pos);
-
                     let strat_msg = serde_json::json!({ "type": "strategy", "strategy": strategy });
                     let _ = socket.send(Message::Text(strat_msg.to_string())).await;
-
                     let bot_elos = [800, 1000, 1200, 1500, 1800, 2100, 2500];
-
                     for (i, elo) in bot_elos.iter().enumerate() {
                         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-
                         let (action, damage) =
                             simulate_bot_action(&strategy, *elo, (i * 1000) as u64);
-                        let bot_msg = serde_json::json!({
-                            "type": "bot_action", "bot_id": i + 1, "action": action, "damage": damage
-                        });
+                        let bot_msg = serde_json::json!({ "type": "bot_action", "bot_id": i + 1, "action": action, "damage": damage });
                         if socket
                             .send(Message::Text(bot_msg.to_string()))
                             .await
@@ -570,6 +576,192 @@ async fn handle_socket(mut socket: WebSocket) {
                             break;
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+// === WEBSOCKET 1v1 LIVE (GTO DUEL - NOWOŚĆ) ===
+async fn ws_duel_handler(
+    ws: WebSocketUpgrade,
+    Query(params): Query<DuelQuery>,
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_duel_socket(socket, params, state))
+}
+
+async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedState) {
+    let (mut sender, mut receiver) = socket.split();
+    // Kanał dla tego konkretnego gracza
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+    // Wątek wysyłający dane DO gracza
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if sender.send(Message::Text(msg)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Wejście do pokoju
+    {
+        let mut rooms = state.lock().unwrap();
+        let room = rooms
+            .entry(params.room_id.clone())
+            .or_insert_with(|| DuelRoom {
+                players: Vec::new(),
+                strategy: None,
+            });
+
+        if room.players.len() >= 2 {
+            let _ = tx
+                .send(serde_json::json!({"type": "error", "msg": "Pokój jest pełny"}).to_string());
+            return;
+        }
+
+        room.players.push(DuelPlayer {
+            user_id: params.user_id,
+            username: params.username.clone(),
+            hp: 1000,
+            action: None,
+            sender: tx.clone(),
+        });
+
+        // Jeśli wbiło 2 graczy - dajemy sygnał "Gotowi"
+        if room.players.len() == 2 {
+            let ready_msg = serde_json::json!({"type": "ready"}).to_string();
+            for p in &room.players {
+                let _ = p.sender.send(ready_msg.clone());
+            }
+        }
+    }
+
+    // Pętla nasłuchująca wiadomości OD gracza
+    while let Some(Ok(msg)) = receiver.next().await {
+        if let Ok(text) = msg.to_text() {
+            if let Ok(client_msg) = serde_json::from_str::<DuelClientMessage>(text) {
+                match client_msg {
+                    DuelClientMessage::NewRound { hand, board, pos } => {
+                        let mut rooms = state.lock().unwrap();
+                        if let Some(room) = rooms.get_mut(&params.room_id) {
+                            // Serwer liczy strategię GTO dla nowego rozdania
+                            let strategy = get_smart_gto_strategy(&hand, &board, "", &pos);
+                            room.strategy = Some(strategy);
+
+                            let start_msg = serde_json::json!({
+                                "type": "round_start",
+                                "hand": hand,
+                                "board": board,
+                                "pos": pos
+                            })
+                            .to_string();
+
+                            for p in &mut room.players {
+                                p.action = None; // Czyścimy akcje na nową rundę
+                                let _ = p.sender.send(start_msg.clone());
+                            }
+                        }
+                    }
+                    DuelClientMessage::Action { action_idx } => {
+                        process_duel_action(&params.room_id, params.user_id, action_idx, &state);
+                    }
+                }
+            }
+        }
+    }
+
+    // Wyjście z pokoju (Rozłączenie)
+    {
+        let mut rooms = state.lock().unwrap();
+        if let Some(room) = rooms.get_mut(&params.room_id) {
+            room.players.retain(|p| p.user_id != params.user_id);
+            let disc_msg = serde_json::json!({"type": "opponent_disconnected"}).to_string();
+            for p in &room.players {
+                let _ = p.sender.send(disc_msg.clone());
+            }
+            if room.players.is_empty() {
+                rooms.remove(&params.room_id);
+            }
+        }
+    }
+}
+
+// Funkcja procesująca akcje i wymierzająca ciosy
+fn process_duel_action(room_id: &str, user_id: i32, action_idx: usize, state: &SharedState) {
+    let mut rooms = state.lock().unwrap();
+    if let Some(room) = rooms.get_mut(room_id) {
+        // Zapisujemy ruch gracza
+        for p in &mut room.players {
+            if p.user_id == user_id {
+                p.action = Some(action_idx);
+            }
+        }
+
+        // Kiedy OBAJ zagrają
+        if room.players.len() == 2
+            && room.players[0].action.is_some()
+            && room.players[1].action.is_some()
+        {
+            if let Some(strategy) = room.strategy {
+                let mut max_prob = 0.0;
+                for prob in &strategy {
+                    if *prob > max_prob {
+                        max_prob = *prob;
+                    }
+                }
+
+                let a1 = room.players[0].action.unwrap();
+                let a2 = room.players[1].action.unwrap();
+
+                // Obliczamy stratę (EV Loss) w HP
+                let loss1 = ((max_prob - strategy[a1]) * 100.0).round() as i32;
+                let loss2 = ((max_prob - strategy[a2]) * 100.0).round() as i32;
+
+                room.players[0].hp = std::cmp::max(0, room.players[0].hp - loss1);
+                room.players[1].hp = std::cmp::max(0, room.players[1].hp - loss2);
+
+                let mut game_over = false;
+                let mut winner_id = None;
+                let mut loser_id = None;
+
+                if room.players[0].hp == 0 || room.players[1].hp == 0 {
+                    game_over = true;
+                    if room.players[0].hp > room.players[1].hp {
+                        winner_id = Some(room.players[0].user_id);
+                        loser_id = Some(room.players[1].user_id);
+                    } else if room.players[1].hp > room.players[0].hp {
+                        winner_id = Some(room.players[1].user_id);
+                        loser_id = Some(room.players[0].user_id);
+                    }
+                }
+
+                let result_msg = serde_json::json!({
+                    "type": "round_result",
+                    "p1_id": room.players[0].user_id,
+                    "p1_hp": room.players[0].hp,
+                    "p1_loss": loss1,
+                    "p2_id": room.players[1].user_id,
+                    "p2_hp": room.players[1].hp,
+                    "p2_loss": loss2,
+                    "game_over": game_over,
+                    "winner_id": winner_id,
+                });
+
+                for p in &mut room.players {
+                    let _ = p.sender.send(result_msg.to_string());
+                    p.action = None;
+                }
+
+                if game_over {
+                    // Update ELO w tle, bez blokowania pokoju!
+                    if let (Some(w), Some(l)) = (winner_id, loser_id) {
+                        tokio::spawn(async move {
+                            let _ = update_duel_elo(w, l).await;
+                        });
+                    }
+                    rooms.remove(room_id);
                 }
             }
         }
@@ -586,6 +778,9 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Inicjalizujemy globalny, bezpieczny dla wątków stan pokoi
+    let shared_state: SharedState = Arc::new(Mutex::new(HashMap::new()));
+
     let app = Router::new()
         .route("/api/login", post(login_handler))
         .route("/api/register", post(register_handler))
@@ -596,11 +791,13 @@ async fn main() {
         .route("/api/solve", get(solve_handler))
         .route("/api/arena", get(arena_handler))
         .route("/api/preflop", get(preflop_handler))
+        .route("/api/friends/add", post(send_friend_request))
+        .route("/api/friends/accept", post(accept_friend_request))
+        .route("/api/friends/list", get(get_friends))
         .route("/ws/arena8", get(ws_arena_handler))
-        .route("/api/friends/add", post(send_friend_request)) // NOWE
-        .route("/api/friends/accept", post(accept_friend_request)) // NOWE
-        .route("/api/friends/list", get(get_friends)) // NOWE
-        .layer(cors);
+        .route("/ws/duel", get(ws_duel_handler)) // NOWY PUNKT WEJŚCIA DLA GTO DUEL
+        .layer(cors)
+        .with_state(shared_state); // Podłączamy bazę pokoi do routera
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
     let addr = format!("0.0.0.0:{}", port);
