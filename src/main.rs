@@ -515,7 +515,65 @@ async fn arena_handler(Query(params): Query<ArenaQuery>) -> Json<serde_json::Val
 }
 
 async fn preflop_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({}))
+    // Generujemy uproszczone, ale realistyczne zakresy GTO (Proof of Concept)
+    // R - Raise (Czerwony), C - Call (Zielony), F - Fold (Szary)
+
+    let mut utg_range = HashMap::new();
+    let mut btn_range = HashMap::new();
+    let ranks = [
+        "A", "K", "Q", "J", "T", "9", "8", "7", "6", "5", "4", "3", "2",
+    ];
+
+    for i in 0..13 {
+        for j in 0..13 {
+            let hand = if i == j {
+                format!("{}{}", ranks[i], ranks[j]) // Pary np. AA, KK
+            } else if i < j {
+                format!("{}s", format!("{}{}", ranks[i], ranks[j])) // Suited np. AKs
+            } else {
+                format!("{}o", format!("{}{}", ranks[j], ranks[i])) // Offsuit np. AKo
+            };
+
+            // Logika dla UTG (Bardzo ciasno - tight)
+            let utg_action = if i == j && i <= 6 {
+                "R"
+            }
+            // Pary 88+
+            else if hand == "AKs" || hand == "AQs" || hand == "AJs" || hand == "KQs" {
+                "R"
+            } else if hand == "AKo" || hand == "AQo" {
+                "R"
+            } else {
+                "F"
+            };
+            utg_range.insert(hand.clone(), utg_action);
+
+            // Logika dla BTN (Szeroko - loose)
+            let btn_action = if i == j {
+                "R"
+            }
+            // Wszystkie pary
+            else if i == 0 {
+                "R"
+            }
+            // Wszystkie asy (A2s+, A2o+)
+            else if (i < 5 && j < 5) || (hand.contains('s') && i <= 8 && j - i <= 2) {
+                "R"
+            }
+            // Broadwaye i suited connectory
+            else if hand == "KJo" || hand == "QJo" {
+                "C"
+            } else {
+                "F"
+            };
+            btn_range.insert(hand, btn_action);
+        }
+    }
+
+    Json(serde_json::json!({
+        "UTG": utg_range,
+        "BTN": btn_range
+    }))
 }
 
 async fn send_friend_request(Json(payload): Json<FriendRequest>) -> Json<serde_json::Value> {
