@@ -75,7 +75,7 @@ struct WsArenaRequest {
     pos: String,
 }
 
-// --- STRUKTURY DLA ZNAJOMYCH ---
+// --- STRUKTURY DLA ZNAJOMYCH & RANKINGU ---
 #[derive(Serialize, Deserialize)]
 struct FriendRequest {
     user_id: i32,
@@ -96,6 +96,14 @@ struct FriendInfo {
     status: String,
 }
 
+// NOWOŚĆ: Struktura dla rankingu
+#[derive(Serialize)]
+struct LeaderboardEntry {
+    rank: usize,
+    username: String,
+    elo: i32,
+}
+
 // --- ZAAWANSOWANE STRUKTURY DLA GTO DUEL (LIVE) ---
 #[derive(Clone)]
 struct DuelPlayer {
@@ -103,7 +111,7 @@ struct DuelPlayer {
     username: String,
     hp: i32,
     action: Option<usize>,
-    sender: mpsc::UnboundedSender<String>, // Kanał do komunikacji z konkretnym graczem
+    sender: mpsc::UnboundedSender<String>,
 }
 
 struct DuelRoom {
@@ -111,7 +119,6 @@ struct DuelRoom {
     strategy: Option<[f32; 4]>,
 }
 
-// Współdzielony stan serwera - przechowuje wszystkie aktywne pokoje
 type SharedState = Arc<Mutex<HashMap<String, DuelRoom>>>;
 
 #[derive(Deserialize)]
@@ -461,6 +468,32 @@ async fn update_stats_handler(Json(payload): Json<UpdateStatsRequest>) -> Json<s
     Json(serde_json::json!({"status": "ok"}))
 }
 
+// NOWOŚĆ: Handler dla pobierania rankingu (TOP 10 w trybie 1v1)
+async fn get_leaderboard_handler() -> Json<Vec<LeaderboardEntry>> {
+    let conn = Connection::open("poker.db").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT username, elo_1v1 FROM users ORDER BY elo_1v1 DESC LIMIT 10")
+        .unwrap();
+
+    let mut leaderboard = Vec::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+        })
+        .unwrap();
+
+    for (i, row) in rows.enumerate() {
+        if let Ok((username, elo)) = row {
+            leaderboard.push(LeaderboardEntry {
+                rank: i + 1,
+                username,
+                elo,
+            });
+        }
+    }
+    Json(leaderboard)
+}
+
 async fn solve_handler(Query(params): Query<SolveQuery>) -> Json<serde_json::Value> {
     let board = params.board.unwrap_or_default();
     let pos = params.pos.unwrap_or_default();
@@ -549,7 +582,7 @@ async fn get_friends(Query(params): Query<HashMap<String, String>>) -> Json<Vec<
     Json(friends_list)
 }
 
-// === WEBSOCKET 1v7 (STARE, DO GRY Z BOTAMI) ===
+// === WEBSOCKET 1v7 (STARE) ===
 async fn ws_arena_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(handle_socket)
 }
@@ -582,7 +615,7 @@ async fn handle_socket(mut socket: WebSocket) {
     }
 }
 
-// === WEBSOCKET 1v1 LIVE (GTO DUEL - NOWOŚĆ) ===
+// === WEBSOCKET 1v1 LIVE (GTO DUEL) ===
 async fn ws_duel_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<DuelQuery>,
@@ -593,10 +626,8 @@ async fn ws_duel_handler(
 
 async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedState) {
     let (mut sender, mut receiver) = socket.split();
-    // Kanał dla tego konkretnego gracza
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
-    // Wątek wysyłający dane DO gracza
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sender.send(Message::Text(msg)).await.is_err() {
@@ -605,7 +636,6 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
         }
     });
 
-    // Wejście do pokoju
     {
         let mut rooms = state.lock().unwrap();
         let room = rooms
@@ -614,13 +644,11 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
                 players: Vec::new(),
                 strategy: None,
             });
-
         if room.players.len() >= 2 {
             let _ = tx
                 .send(serde_json::json!({"type": "error", "msg": "Pokój jest pełny"}).to_string());
             return;
         }
-
         room.players.push(DuelPlayer {
             user_id: params.user_id,
             username: params.username.clone(),
@@ -628,8 +656,6 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
             action: None,
             sender: tx.clone(),
         });
-
-        // Jeśli wbiło 2 graczy - dajemy sygnał "Gotowi"
         if room.players.len() == 2 {
             let ready_msg = serde_json::json!({"type": "ready"}).to_string();
             for p in &room.players {
@@ -638,7 +664,6 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
         }
     }
 
-    // Pętla nasłuchująca wiadomości OD gracza
     while let Some(Ok(msg)) = receiver.next().await {
         if let Ok(text) = msg.to_text() {
             if let Ok(client_msg) = serde_json::from_str::<DuelClientMessage>(text) {
@@ -646,20 +671,11 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
                     DuelClientMessage::NewRound { hand, board, pos } => {
                         let mut rooms = state.lock().unwrap();
                         if let Some(room) = rooms.get_mut(&params.room_id) {
-                            // Serwer liczy strategię GTO dla nowego rozdania
                             let strategy = get_smart_gto_strategy(&hand, &board, "", &pos);
                             room.strategy = Some(strategy);
-
-                            let start_msg = serde_json::json!({
-                                "type": "round_start",
-                                "hand": hand,
-                                "board": board,
-                                "pos": pos
-                            })
-                            .to_string();
-
+                            let start_msg = serde_json::json!({ "type": "round_start", "hand": hand, "board": board, "pos": pos }).to_string();
                             for p in &mut room.players {
-                                p.action = None; // Czyścimy akcje na nową rundę
+                                p.action = None;
                                 let _ = p.sender.send(start_msg.clone());
                             }
                         }
@@ -672,7 +688,6 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
         }
     }
 
-    // Wyjście z pokoju (Rozłączenie)
     {
         let mut rooms = state.lock().unwrap();
         if let Some(room) = rooms.get_mut(&params.room_id) {
@@ -688,18 +703,14 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
     }
 }
 
-// Funkcja procesująca akcje i wymierzająca ciosy
 fn process_duel_action(room_id: &str, user_id: i32, action_idx: usize, state: &SharedState) {
     let mut rooms = state.lock().unwrap();
     if let Some(room) = rooms.get_mut(room_id) {
-        // Zapisujemy ruch gracza
         for p in &mut room.players {
             if p.user_id == user_id {
                 p.action = Some(action_idx);
             }
         }
-
-        // Kiedy OBAJ zagrają
         if room.players.len() == 2
             && room.players[0].action.is_some()
             && room.players[1].action.is_some()
@@ -711,21 +722,16 @@ fn process_duel_action(room_id: &str, user_id: i32, action_idx: usize, state: &S
                         max_prob = *prob;
                     }
                 }
-
                 let a1 = room.players[0].action.unwrap();
                 let a2 = room.players[1].action.unwrap();
-
-                // Obliczamy stratę (EV Loss) w HP
                 let loss1 = ((max_prob - strategy[a1]) * 100.0).round() as i32;
                 let loss2 = ((max_prob - strategy[a2]) * 100.0).round() as i32;
-
                 room.players[0].hp = std::cmp::max(0, room.players[0].hp - loss1);
                 room.players[1].hp = std::cmp::max(0, room.players[1].hp - loss2);
 
                 let mut game_over = false;
                 let mut winner_id = None;
                 let mut loser_id = None;
-
                 if room.players[0].hp == 0 || room.players[1].hp == 0 {
                     game_over = true;
                     if room.players[0].hp > room.players[1].hp {
@@ -738,24 +744,14 @@ fn process_duel_action(room_id: &str, user_id: i32, action_idx: usize, state: &S
                 }
 
                 let result_msg = serde_json::json!({
-                    "type": "round_result",
-                    "p1_id": room.players[0].user_id,
-                    "p1_hp": room.players[0].hp,
-                    "p1_loss": loss1,
-                    "p2_id": room.players[1].user_id,
-                    "p2_hp": room.players[1].hp,
-                    "p2_loss": loss2,
-                    "game_over": game_over,
-                    "winner_id": winner_id,
+                    "type": "round_result", "p1_id": room.players[0].user_id, "p1_hp": room.players[0].hp, "p1_loss": loss1,
+                    "p2_id": room.players[1].user_id, "p2_hp": room.players[1].hp, "p2_loss": loss2, "game_over": game_over, "winner_id": winner_id,
                 });
-
                 for p in &mut room.players {
                     let _ = p.sender.send(result_msg.to_string());
                     p.action = None;
                 }
-
                 if game_over {
-                    // Update ELO w tle, bez blokowania pokoju!
                     if let (Some(w), Some(l)) = (winner_id, loser_id) {
                         tokio::spawn(async move {
                             let _ = update_duel_elo(w, l).await;
@@ -777,8 +773,6 @@ async fn main() {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
-
-    // Inicjalizujemy globalny, bezpieczny dla wątków stan pokoi
     let shared_state: SharedState = Arc::new(Mutex::new(HashMap::new()));
 
     let app = Router::new()
@@ -794,14 +788,14 @@ async fn main() {
         .route("/api/friends/add", post(send_friend_request))
         .route("/api/friends/accept", post(accept_friend_request))
         .route("/api/friends/list", get(get_friends))
+        .route("/api/leaderboard", get(get_leaderboard_handler)) // NOWE: RANKING
         .route("/ws/arena8", get(ws_arena_handler))
-        .route("/ws/duel", get(ws_duel_handler)) // NOWY PUNKT WEJŚCIA DLA GTO DUEL
+        .route("/ws/duel", get(ws_duel_handler))
         .layer(cors)
-        .with_state(shared_state); // Podłączamy bazę pokoi do routera
+        .with_state(shared_state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3001".to_string());
     let addr = format!("0.0.0.0:{}", port);
-
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     println!("✅ Gotowe! Serwer działa na adresie: {}", addr);
 
