@@ -32,6 +32,9 @@ struct UserResponse {
     elo_train: Option<i32>,
     elo_1v1: Option<i32>,
     elo_1v7: Option<i32>,
+    display_name: Option<String>,
+    country: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -50,6 +53,14 @@ struct UpdateStatsRequest {
     elo: i32,
     streak: i32,
     hands_played: i32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UpdateProfileRequest {
+    user_id: i32,
+    display_name: String,
+    country: String,
+    status: String,
 }
 
 #[derive(Deserialize)]
@@ -75,7 +86,6 @@ struct WsArenaRequest {
     pos: String,
 }
 
-// --- STRUKTURY DLA ZNAJOMYCH & RANKINGU ---
 #[derive(Serialize, Deserialize)]
 struct FriendRequest {
     user_id: i32,
@@ -96,7 +106,6 @@ struct FriendInfo {
     status: String,
 }
 
-// NOWOŚĆ: Struktura dla rankingu
 #[derive(Serialize)]
 struct LeaderboardEntry {
     rank: usize,
@@ -104,7 +113,7 @@ struct LeaderboardEntry {
     elo: i32,
 }
 
-// --- ZAAWANSOWANE STRUKTURY DLA GTO DUEL (LIVE) ---
+// --- STRUKTURY GTO DUEL (LIVE) ---
 #[derive(Clone)]
 struct DuelPlayer {
     user_id: i32,
@@ -141,7 +150,7 @@ enum DuelClientMessage {
     Action { action_idx: usize },
 }
 
-// --- LOGIKA POKEROWA (GTO & Heurystyka) ---
+// --- LOGIKA POKEROWA ---
 fn evaluate_poker_strength(hand: &str, board: &str) -> f32 {
     let r1 = &hand[0..1];
     let r2 = &hand[2..3];
@@ -338,7 +347,16 @@ fn simulate_bot_action(strategy: &[f32; 4], bot_elo: i32, offset: u64) -> (Strin
 
 fn init_db() -> Result<()> {
     let conn = Connection::open("poker.db")?;
-    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, elo_train INTEGER NOT NULL DEFAULT 1000, elo_1v1 INTEGER NOT NULL DEFAULT 1000, elo_1v7 INTEGER NOT NULL DEFAULT 1000, streak INTEGER NOT NULL DEFAULT 0, hands_played INTEGER NOT NULL DEFAULT 0)", [])?;
+    conn.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, elo_train INTEGER NOT NULL DEFAULT 1000, elo_1v1 INTEGER NOT NULL DEFAULT 1000, elo_1v7 INTEGER NOT NULL DEFAULT 1000, streak INTEGER NOT NULL DEFAULT 0, hands_played INTEGER NOT NULL DEFAULT 0, display_name TEXT DEFAULT '', country TEXT DEFAULT '', status TEXT DEFAULT '')", [])?;
+
+    // Na wszelki wypadek (jeśli tabela już istnieje), bezpiecznie dokładamy kolumny:
+    let _ = conn.execute(
+        "ALTER TABLE users ADD COLUMN display_name TEXT DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN country TEXT DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT ''", []);
+
     conn.execute("CREATE TABLE IF NOT EXISTS stats (id INTEGER PRIMARY KEY, elo_train INTEGER NOT NULL DEFAULT 1000, elo_1v1 INTEGER NOT NULL DEFAULT 1000, elo_1v7 INTEGER NOT NULL DEFAULT 1000, streak INTEGER NOT NULL DEFAULT 0, hands_played INTEGER NOT NULL DEFAULT 0)", [])?;
     conn.execute("CREATE TABLE IF NOT EXISTS friends (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, friend_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', UNIQUE(user_id, friend_id))", [])?;
 
@@ -356,10 +374,10 @@ async fn update_duel_elo(winner_id: i32, loser_id: i32) -> Result<(), rusqlite::
     Ok(())
 }
 
-// --- HANDLERY AXUM (REST API) ---
+// --- HANDLERY AXUM ---
 async fn login_handler(Json(payload): Json<AuthRequest>) -> Json<UserResponse> {
     let conn = Connection::open("poker.db").unwrap();
-    let mut stmt = conn.prepare("SELECT id, username, elo_train, elo_1v1, elo_1v7 FROM users WHERE username = ?1 AND password = ?2").unwrap();
+    let mut stmt = conn.prepare("SELECT id, username, elo_train, elo_1v1, elo_1v7, display_name, country, status FROM users WHERE username = ?1 AND password = ?2").unwrap();
     match stmt.query_row(params![payload.username, payload.password], |row| {
         Ok((
             row.get::<_, i32>(0)?,
@@ -367,9 +385,12 @@ async fn login_handler(Json(payload): Json<AuthRequest>) -> Json<UserResponse> {
             row.get::<_, i32>(2)?,
             row.get::<_, i32>(3)?,
             row.get::<_, i32>(4)?,
+            row.get::<_, String>(5).unwrap_or_default(),
+            row.get::<_, String>(6).unwrap_or_default(),
+            row.get::<_, String>(7).unwrap_or_default(),
         ))
     }) {
-        Ok((id, username, et, e1, e7)) => Json(UserResponse {
+        Ok((id, username, et, e1, e7, dn, c, s)) => Json(UserResponse {
             success: true,
             message: "OK".to_string(),
             id: Some(id),
@@ -377,6 +398,9 @@ async fn login_handler(Json(payload): Json<AuthRequest>) -> Json<UserResponse> {
             elo_train: Some(et),
             elo_1v1: Some(e1),
             elo_1v7: Some(e7),
+            display_name: Some(dn),
+            country: Some(c),
+            status: Some(s),
         }),
         Err(_) => Json(UserResponse {
             success: false,
@@ -386,6 +410,9 @@ async fn login_handler(Json(payload): Json<AuthRequest>) -> Json<UserResponse> {
             elo_train: None,
             elo_1v1: None,
             elo_1v7: None,
+            display_name: None,
+            country: None,
+            status: None,
         }),
     }
 }
@@ -404,6 +431,9 @@ async fn register_handler(Json(payload): Json<AuthRequest>) -> Json<UserResponse
             elo_train: Some(1000),
             elo_1v1: Some(1000),
             elo_1v7: Some(1000),
+            display_name: Some("".to_string()),
+            country: Some("".to_string()),
+            status: Some("".to_string()),
         }),
         Err(_) => Json(UserResponse {
             success: false,
@@ -413,7 +443,28 @@ async fn register_handler(Json(payload): Json<AuthRequest>) -> Json<UserResponse
             elo_train: None,
             elo_1v1: None,
             elo_1v7: None,
+            display_name: None,
+            country: None,
+            status: None,
         }),
+    }
+}
+
+async fn update_profile_handler(
+    Json(payload): Json<UpdateProfileRequest>,
+) -> Json<serde_json::Value> {
+    let conn = Connection::open("poker.db").unwrap();
+    match conn.execute(
+        "UPDATE users SET display_name = ?1, country = ?2, status = ?3 WHERE id = ?4",
+        params![
+            payload.display_name,
+            payload.country,
+            payload.status,
+            payload.user_id
+        ],
+    ) {
+        Ok(_) => Json(serde_json::json!({"success": true, "message": "Zapisano!"})),
+        Err(_) => Json(serde_json::json!({"success": false, "message": "Błąd bazy danych"})),
     }
 }
 
@@ -454,34 +505,21 @@ async fn update_stats_handler(Json(payload): Json<UpdateStatsRequest>) -> Json<s
             q,
             params![payload.elo, payload.streak, payload.hands_played, uid],
         );
-    } else {
-        let q = match payload.mode.as_str() {
-            "1v1" => "UPDATE stats SET elo_1v1 = ?1, streak = ?2, hands_played = ?3 WHERE id = 1",
-            "1v7" => "UPDATE stats SET elo_1v7 = ?1, streak = ?2, hands_played = ?3 WHERE id = 1",
-            _ => "UPDATE stats SET elo_train = ?1, streak = ?2, hands_played = ?3 WHERE id = 1",
-        };
-        let _ = conn.execute(
-            q,
-            params![payload.elo, payload.streak, payload.hands_played],
-        );
     }
     Json(serde_json::json!({"status": "ok"}))
 }
 
-// NOWOŚĆ: Handler dla pobierania rankingu (TOP 10 w trybie 1v1)
 async fn get_leaderboard_handler() -> Json<Vec<LeaderboardEntry>> {
     let conn = Connection::open("poker.db").unwrap();
     let mut stmt = conn
         .prepare("SELECT username, elo_1v1 FROM users ORDER BY elo_1v1 DESC LIMIT 10")
         .unwrap();
-
     let mut leaderboard = Vec::new();
     let rows = stmt
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
         })
         .unwrap();
-
     for (i, row) in rows.enumerate() {
         if let Ok((username, elo)) = row {
             leaderboard.push(LeaderboardEntry {
@@ -515,9 +553,6 @@ async fn arena_handler(Query(params): Query<ArenaQuery>) -> Json<serde_json::Val
 }
 
 async fn preflop_handler() -> Json<serde_json::Value> {
-    // Generujemy uproszczone, ale realistyczne zakresy GTO (Proof of Concept)
-    // R - Raise (Czerwony), C - Call (Zielony), F - Fold (Szary)
-
     let mut utg_range = HashMap::new();
     let mut btn_range = HashMap::new();
     let ranks = [
@@ -527,19 +562,15 @@ async fn preflop_handler() -> Json<serde_json::Value> {
     for i in 0..13 {
         for j in 0..13 {
             let hand = if i == j {
-                format!("{}{}", ranks[i], ranks[j]) // Pary np. AA, KK
+                format!("{}{}", ranks[i], ranks[j])
             } else if i < j {
-                format!("{}s", format!("{}{}", ranks[i], ranks[j])) // Suited np. AKs
+                format!("{}s", format!("{}{}", ranks[i], ranks[j]))
             } else {
-                format!("{}o", format!("{}{}", ranks[j], ranks[i])) // Offsuit np. AKo
+                format!("{}o", format!("{}{}", ranks[j], ranks[i]))
             };
-
-            // Logika dla UTG (Bardzo ciasno - tight)
             let utg_action = if i == j && i <= 6 {
                 "R"
-            }
-            // Pary 88+
-            else if hand == "AKs" || hand == "AQs" || hand == "AJs" || hand == "KQs" {
+            } else if hand == "AKs" || hand == "AQs" || hand == "AJs" || hand == "KQs" {
                 "R"
             } else if hand == "AKo" || hand == "AQo" {
                 "R"
@@ -547,21 +578,13 @@ async fn preflop_handler() -> Json<serde_json::Value> {
                 "F"
             };
             utg_range.insert(hand.clone(), utg_action);
-
-            // Logika dla BTN (Szeroko - loose)
             let btn_action = if i == j {
                 "R"
-            }
-            // Wszystkie pary
-            else if i == 0 {
+            } else if i == 0 {
                 "R"
-            }
-            // Wszystkie asy (A2s+, A2o+)
-            else if (i < 5 && j < 5) || (hand.contains('s') && i <= 8 && j - i <= 2) {
+            } else if (i < 5 && j < 5) || (hand.contains('s') && i <= 8 && j - i <= 2) {
                 "R"
-            }
-            // Broadwaye i suited connectory
-            else if hand == "KJo" || hand == "QJo" {
+            } else if hand == "KJo" || hand == "QJo" {
                 "C"
             } else {
                 "F"
@@ -569,11 +592,7 @@ async fn preflop_handler() -> Json<serde_json::Value> {
             btn_range.insert(hand, btn_action);
         }
     }
-
-    Json(serde_json::json!({
-        "UTG": utg_range,
-        "BTN": btn_range
-    }))
+    Json(serde_json::json!({ "UTG": utg_range, "BTN": btn_range }))
 }
 
 async fn send_friend_request(Json(payload): Json<FriendRequest>) -> Json<serde_json::Value> {
@@ -617,11 +636,7 @@ async fn get_friends(Query(params): Query<HashMap<String, String>>) -> Json<Vec<
         .unwrap_or(0);
     let conn = Connection::open("poker.db").unwrap();
     let mut friends_list = Vec::new();
-    let mut stmt = conn.prepare("
-        SELECT u.id, u.username, u.elo_1v1, f.status FROM users u JOIN friends f ON u.id = f.friend_id WHERE f.user_id = ?1 AND f.status = 'accepted'
-        UNION
-        SELECT u.id, u.username, u.elo_1v1, f.status FROM users u JOIN friends f ON u.id = f.user_id WHERE f.friend_id = ?1 AND f.status = 'pending'
-    ").unwrap();
+    let mut stmt = conn.prepare("SELECT u.id, u.username, u.elo_1v1, f.status FROM users u JOIN friends f ON u.id = f.friend_id WHERE f.user_id = ?1 AND f.status = 'accepted' UNION SELECT u.id, u.username, u.elo_1v1, f.status FROM users u JOIN friends f ON u.id = f.user_id WHERE f.friend_id = ?1 AND f.status = 'pending'").unwrap();
     let friend_iter = stmt
         .query_map(params![user_id], |row| {
             Ok(FriendInfo {
@@ -640,11 +655,9 @@ async fn get_friends(Query(params): Query<HashMap<String, String>>) -> Json<Vec<
     Json(friends_list)
 }
 
-// === WEBSOCKET 1v7 (STARE) ===
 async fn ws_arena_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(handle_socket)
 }
-
 async fn handle_socket(mut socket: WebSocket) {
     if let Some(msg) = socket.recv().await {
         if let Ok(msg) = msg {
@@ -673,7 +686,6 @@ async fn handle_socket(mut socket: WebSocket) {
     }
 }
 
-// === WEBSOCKET 1v1 LIVE (GTO DUEL) ===
 async fn ws_duel_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<DuelQuery>,
@@ -681,11 +693,9 @@ async fn ws_duel_handler(
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_duel_socket(socket, params, state))
 }
-
 async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedState) {
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if sender.send(Message::Text(msg)).await.is_err() {
@@ -693,7 +703,6 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
             }
         }
     });
-
     {
         let mut rooms = state.lock().unwrap();
         let room = rooms
@@ -721,7 +730,6 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
             }
         }
     }
-
     while let Some(Ok(msg)) = receiver.next().await {
         if let Ok(text) = msg.to_text() {
             if let Ok(client_msg) = serde_json::from_str::<DuelClientMessage>(text) {
@@ -729,8 +737,7 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
                     DuelClientMessage::NewRound { hand, board, pos } => {
                         let mut rooms = state.lock().unwrap();
                         if let Some(room) = rooms.get_mut(&params.room_id) {
-                            let strategy = get_smart_gto_strategy(&hand, &board, "", &pos);
-                            room.strategy = Some(strategy);
+                            room.strategy = Some(get_smart_gto_strategy(&hand, &board, "", &pos));
                             let start_msg = serde_json::json!({ "type": "round_start", "hand": hand, "board": board, "pos": pos }).to_string();
                             for p in &mut room.players {
                                 p.action = None;
@@ -745,7 +752,6 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
             }
         }
     }
-
     {
         let mut rooms = state.lock().unwrap();
         if let Some(room) = rooms.get_mut(&params.room_id) {
@@ -760,7 +766,6 @@ async fn handle_duel_socket(socket: WebSocket, params: DuelQuery, state: SharedS
         }
     }
 }
-
 fn process_duel_action(room_id: &str, user_id: i32, action_idx: usize, state: &SharedState) {
     let mut rooms = state.lock().unwrap();
     if let Some(room) = rooms.get_mut(room_id) {
@@ -800,11 +805,7 @@ fn process_duel_action(room_id: &str, user_id: i32, action_idx: usize, state: &S
                         loser_id = Some(room.players[0].user_id);
                     }
                 }
-
-                let result_msg = serde_json::json!({
-                    "type": "round_result", "p1_id": room.players[0].user_id, "p1_hp": room.players[0].hp, "p1_loss": loss1,
-                    "p2_id": room.players[1].user_id, "p2_hp": room.players[1].hp, "p2_loss": loss2, "game_over": game_over, "winner_id": winner_id,
-                });
+                let result_msg = serde_json::json!({ "type": "round_result", "p1_id": room.players[0].user_id, "p1_hp": room.players[0].hp, "p1_loss": loss1, "p2_id": room.players[1].user_id, "p2_hp": room.players[1].hp, "p2_loss": loss2, "game_over": game_over, "winner_id": winner_id });
                 for p in &mut room.players {
                     let _ = p.sender.send(result_msg.to_string());
                     p.action = None;
@@ -836,6 +837,7 @@ async fn main() {
     let app = Router::new()
         .route("/api/login", post(login_handler))
         .route("/api/register", post(register_handler))
+        .route("/api/profile/update", post(update_profile_handler)) // NOWA KOŃCÓWKA EDYCJI!
         .route(
             "/api/stats",
             get(get_stats_handler).post(update_stats_handler),
@@ -846,7 +848,7 @@ async fn main() {
         .route("/api/friends/add", post(send_friend_request))
         .route("/api/friends/accept", post(accept_friend_request))
         .route("/api/friends/list", get(get_friends))
-        .route("/api/leaderboard", get(get_leaderboard_handler)) // NOWE: RANKING
+        .route("/api/leaderboard", get(get_leaderboard_handler))
         .route("/ws/arena8", get(ws_arena_handler))
         .route("/ws/duel", get(ws_duel_handler))
         .layer(cors)
@@ -856,6 +858,5 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     println!("✅ Gotowe! Serwer działa na adresie: {}", addr);
-
     axum::serve(listener, app).await.unwrap();
 }
